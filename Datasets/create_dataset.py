@@ -552,7 +552,7 @@ def get_dataset_without_full_label(args, img_size=384, train_aug=False, k=6, lb_
     l_data = sorted(l_data)
     
     # Đọc danh sách unlabeled data
-    with open(f'{args.data.train_folder}/unlabeled.txt', 'r') as f:
+    with open(f'{args.data.unlabeled_folder}/unlabeled.txt', 'r') as f:
         u_data = sorted([line.replace('\n', '') for line in f.readlines()])
 
     # Kiểm tra dữ liệu
