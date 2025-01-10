@@ -1,7 +1,3 @@
-'''
-The default exp_name is tmp. Change it before formal training! isic2018 PH2 DMF SKD
-nohup python -u multi_train_adapt.py --exp_name test --config_yml Configs/multi_train_local.yml --model MedFormer --batch_size 16 --adapt_method False --num_domains 1 --dataset PH2  --k_fold 4 > 4MedFormer_PH2.out 2>&1 &
-'''
 import argparse
 from sqlite3 import adapt
 import yaml
@@ -346,112 +342,27 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
               f'IoU2: {iou_train_sum_2/num_train:.4f}')
 
         # -----------------------------------------------------------------
-        # validate 1
+        # validate both models
         # ----------------------------------------------------------------
         model1.eval()
-        
-        dice_val_sum = 0
-        iou_val_sum = 0
-        loss_val_sum = 0
-        hd_val_sum = 0  # Thêm HD sum
-        num_val = 0
-
-        # Add tqdm progress bar for validation
-        val_loop = tqdm(val_loader, desc=f'Epoch {epoch} Validation Model 1', leave=False)
-        for batch in val_loop:
-            img = batch['image'].cuda().float()
-            label = batch['label'].cuda().float()
-            
-            batch_len = img.shape[0]
-
-            with torch.no_grad():
-                output = model1(img)
-                output = torch.softmax(output, dim=1)
-
-                # Calculate loss
-                losses = []
-                for function in criterion:
-                    losses.append(function(output, label))
-                loss = sum(w * l for w, l in zip(loss_weights, losses))
-                loss_val_sum += loss.item() * batch_len
-
-                # Calculate metrics
-                output_np = output.argmax(dim=1).cpu().numpy()
-                label_np = label.argmax(dim=1).cpu().numpy()
-                
-                # Calculate per-class metrics
-                dice_scores = [calc_dice(output_np == i, label_np == i) 
-                             for i in range(output.shape[1])]
-                iou_scores = [calc_iou(output_np == i, label_np == i) 
-                            for i in range(output.shape[1])]
-                hd_scores = [calc_hd(output_np == i, label_np == i) 
-                           for i in range(output.shape[1])]
-                
-                dice_val = np.mean(dice_scores)
-                iou_val = np.mean(iou_scores)
-                hd_val = np.mean(hd_scores)
-                
-                dice_val_sum += dice_val * batch_len
-                iou_val_sum += iou_val * batch_len
-                hd_val_sum += hd_val * batch_len
-
-                # Update progress bar
-                val_loop.set_postfix({
-                    'Loss': f'{loss.item():.4f}',
-                    'Dice': f'{dice_val:.4f}',
-                    'HD': f'{hd_val:.4f}'
-                })
-
-                num_val += batch_len
-                if config.debug: break
-
-        # Calculate epoch metrics
-        loss_val_epoch = loss_val_sum/num_val
-        dice_val_epoch = dice_val_sum/num_val
-        iou_val_epoch = iou_val_sum/num_val
-        hd_val_epoch = hd_val_sum/num_val
-
-        # Calculate combined score
-        hd_norm = np.exp(-hd_val_epoch/100)  # Normalize HD score
-        combined_score = w_dice * dice_val_epoch + w_hd * hd_norm
-
-        # Log validation metrics
-        file_log.write(f'Epoch {epoch}, Model 1 Validation || '
-                      f'Loss: {loss_val_epoch:.4f}, '
-                      f'Dice: {dice_val_epoch:.4f}, '
-                      f'HD: {hd_val_epoch:.4f}, '
-                      f'Combined Score: {combined_score:.4f}, '
-                      f'IoU: {iou_val_epoch:.4f}')
-        file_log.flush()
-
-        # Save model if combined score improves
-        if combined_score > max_score:
-            max_score = combined_score
-            best_epoch = epoch
-            model = model1  # Choose model1 as the best model
-            torch.save(model.state_dict(), best_model_dir)
-            
-            message = (f'New best epoch {epoch}! '
-                      f'Combined score improved to {combined_score:.4f} ==========\n'
-                      f'Dice: {dice_val_epoch:.4f}, HD: {hd_val_epoch:.4f} ==========')
-            
-            file_log.write(message + '\n')
-            file_log.flush()
-            print(message)
-
-        # -----------------------------------------------------------------
-        # validate 2
-        # ----------------------------------------------------------------
         model2.eval()
         
-        dice_val_sum = 0
-        iou_val_sum = 0
-        loss_val_sum = 0
-        hd_val_sum = 0  # Thêm HD sum
+        # Validate model 1
+        dice_val_sum_1 = 0
+        iou_val_sum_1 = 0
+        loss_val_sum_1 = 0
+        hd_val_sum_1 = 0
+        
+        # Validate model 2
+        dice_val_sum_2 = 0
+        iou_val_sum_2 = 0
+        loss_val_sum_2 = 0
+        hd_val_sum_2 = 0
+        
         num_val = 0
 
         # Add tqdm progress bar for validation
-        val_loop = tqdm(val_loader, desc=f'Epoch {epoch} Validation Model 2', leave=False)
+        val_loop = tqdm(val_loader, desc=f'Epoch {epoch} Validation', leave=False)
         for batch in val_loop:
             img = batch['image'].cuda().float()
             label = batch['label'].cuda().float()
@@ -459,79 +370,121 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
             batch_len = img.shape[0]
 
             with torch.no_grad():
-                output = model2(img)
-                output = torch.softmax(output, dim=1)
+                # Evaluate model 1
+                output1 = model1(img)
+                output1 = torch.softmax(output1, dim=1)
 
-                # Calculate loss
-                losses = []
+                # Calculate loss for model 1
+                losses1 = []
                 for function in criterion:
-                    losses.append(function(output, label))
-                loss = sum(w * l for w, l in zip(loss_weights, losses))
-                loss_val_sum += loss.item() * batch_len
+                    losses1.append(function(output1, label))
+                loss1 = sum(w * l for w, l in zip(loss_weights, losses1))
+                loss_val_sum_1 += loss1.item() * batch_len
 
-                # Calculate metrics
-                output_np = output.argmax(dim=1).cpu().numpy()
+                # Evaluate model 2
+                output2 = model2(img)
+                output2 = torch.softmax(output2, dim=1)
+
+                # Calculate loss for model 2
+                losses2 = []
+                for function in criterion:
+                    losses2.append(function(output2, label))
+                loss2 = sum(w * l for w, l in zip(loss_weights, losses2))
+                loss_val_sum_2 += loss2.item() * batch_len
+
+                # Calculate metrics for model 1
+                output1_np = output1.argmax(dim=1).cpu().numpy()
                 label_np = label.argmax(dim=1).cpu().numpy()
                 
-                # Calculate per-class metrics
-                dice_scores = [calc_dice(output_np == i, label_np == i) 
-                             for i in range(output.shape[1])]
-                iou_scores = [calc_iou(output_np == i, label_np == i) 
-                            for i in range(output.shape[1])]
-                hd_scores = [calc_hd(output_np == i, label_np == i) 
-                           for i in range(output.shape[1])]
+                dice_scores1 = [calc_dice(output1_np == i, label_np == i) 
+                             for i in range(output1.shape[1])]
+                iou_scores1 = [calc_iou(output1_np == i, label_np == i) 
+                            for i in range(output1.shape[1])]
+                hd_scores1 = [calc_hd(output1_np == i, label_np == i) 
+                           for i in range(output1.shape[1])]
                 
-                dice_val = np.mean(dice_scores)
-                iou_val = np.mean(iou_scores)
-                hd_val = np.mean(hd_scores)
+                # Calculate metrics for model 2
+                output2_np = output2.argmax(dim=1).cpu().numpy()
                 
-                dice_val_sum += dice_val * batch_len
-                iou_val_sum += iou_val * batch_len
-                hd_val_sum += hd_val * batch_len
+                dice_scores2 = [calc_dice(output2_np == i, label_np == i) 
+                             for i in range(output2.shape[1])]
+                iou_scores2 = [calc_iou(output2_np == i, label_np == i) 
+                            for i in range(output2.shape[1])]
+                hd_scores2 = [calc_hd(output2_np == i, label_np == i) 
+                           for i in range(output2.shape[1])]
+                
+                # Update sums for both models
+                dice_val_sum_1 += np.mean(dice_scores1) * batch_len
+                iou_val_sum_1 += np.mean(iou_scores1) * batch_len
+                hd_val_sum_1 += np.mean(hd_scores1) * batch_len
+                
+                dice_val_sum_2 += np.mean(dice_scores2) * batch_len
+                iou_val_sum_2 += np.mean(iou_scores2) * batch_len
+                hd_val_sum_2 += np.mean(hd_scores2) * batch_len
 
                 # Update progress bar
                 val_loop.set_postfix({
-                    'Loss': f'{loss.item():.4f}',
-                    'Dice': f'{dice_val:.4f}',
-                    'HD': f'{hd_val:.4f}'
+                    'Loss1': f'{loss1.item():.4f}',
+                    'Loss2': f'{loss2.item():.4f}',
+                    'Dice1': f'{np.mean(dice_scores1):.4f}',
+                    'Dice2': f'{np.mean(dice_scores2):.4f}'
                 })
 
                 num_val += batch_len
                 if config.debug: break
 
-        # Calculate epoch metrics
-        loss_val_epoch = loss_val_sum/num_val
-        dice_val_epoch = dice_val_sum/num_val
-        iou_val_epoch = iou_val_sum/num_val
-        hd_val_epoch = hd_val_sum/num_val
+        # Calculate final metrics for both models
+        metrics1 = {
+            'loss': loss_val_sum_1/num_val,
+            'dice': dice_val_sum_1/num_val,
+            'iou': iou_val_sum_1/num_val,
+            'hd': hd_val_sum_1/num_val
+        }
+        
+        metrics2 = {
+            'loss': loss_val_sum_2/num_val,
+            'dice': dice_val_sum_2/num_val,
+            'iou': iou_val_sum_2/num_val,
+            'hd': hd_val_sum_2/num_val
+        }
 
-        # Calculate combined score
-        hd_norm = np.exp(-hd_val_epoch/100)  # Normalize HD score
-        combined_score = w_dice * dice_val_epoch + w_hd * hd_norm
+        # Calculate combined scores for both models
+        hd_norm1 = np.exp(-metrics1['hd']/100)
+        hd_norm2 = np.exp(-metrics2['hd']/100)
+        
+        combined_score1 = w_dice * metrics1['dice'] + w_hd * hd_norm1
+        combined_score2 = w_dice * metrics2['dice'] + w_hd * hd_norm2
 
-        # Log validation metrics
-        file_log.write(f'Epoch {epoch}, Model 2 Validation || '
-                      f'Loss: {loss_val_epoch:.4f}, '
-                      f'Dice: {dice_val_epoch:.4f}, '
-                      f'HD: {hd_val_epoch:.4f}, '
-                      f'Combined Score: {combined_score:.4f}, '
-                      f'IoU: {iou_val_epoch:.4f}')
-        file_log.flush()
-
-        # Save model if combined score improves
-        if combined_score > max_score:
-            max_score = combined_score
+        # Compare and save the better model
+        if max(combined_score1, combined_score2) > max_score:
+            max_score = max(combined_score1, combined_score2)
             best_epoch = epoch
-            model = model2  # Choose model2 as the best model
+            
+            if combined_score1 > combined_score2:
+                model = model1
+                best_metrics = metrics1
+                message = (f'New best epoch {epoch} (Model 1)! '
+                          f'Combined score: {combined_score1:.4f}\n'
+                          f'Dice: {metrics1["dice"]:.4f}, HD: {metrics1["hd"]:.4f}')
+            else:
+                model = model2
+                best_metrics = metrics2
+                message = (f'New best epoch {epoch} (Model 2)! '
+                          f'Combined score: {combined_score2:.4f}\n'
+                          f'Dice: {metrics2["dice"]:.4f}, HD: {metrics2["hd"]:.4f}')
+            
             torch.save(model.state_dict(), best_model_dir)
-            
-            message = (f'New best epoch {epoch}! '
-                      f'Combined score improved to {combined_score:.4f} ==========\n'
-                      f'Dice: {dice_val_epoch:.4f}, HD: {hd_val_epoch:.4f} ==========')
-            
             file_log.write(message + '\n')
             file_log.flush()
             print(message)
+
+        # Log validation metrics for both models
+        file_log.write(f'Epoch {epoch} Validation:\n')
+        file_log.write(f'Model 1 || Loss: {metrics1["loss"]:.4f}, Dice: {metrics1["dice"]:.4f}, '
+                      f'HD: {metrics1["hd"]:.4f}, Combined Score: {combined_score1:.4f}\n')
+        file_log.write(f'Model 2 || Loss: {metrics2["loss"]:.4f}, Dice: {metrics2["dice"]:.4f}, '
+                      f'HD: {metrics2["hd"]:.4f}, Combined Score: {combined_score2:.4f}\n')
+        file_log.flush()
 
         # Update learning rate schedulers
         scheduler1.step()
@@ -686,7 +639,7 @@ if __name__=='__main__':
     store_config = config
     config = DotDict(config)
     
-    folds_to_train = [2,3,4,5]
+    folds_to_train = [4]
     
     for fold in folds_to_train:
         print(f"\n=== Training Fold {fold} ===")
