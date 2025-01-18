@@ -178,17 +178,48 @@ class StrongWeakAugment2(torch.utils.data.Dataset):
 
         self.num_samples = len(self.dataset)
 
-        w_p = 0.5
-        s_p = 1.0
+        w_p = 0.3
+        s_p = 0.7
         self.weak_augment = A.Compose([
             A.Resize(img_size, img_size),
-            A.HorizontalFlip(p=w_p),
-            A.VerticalFlip(p=w_p)
+            A.ElasticTransform(
+                alpha=30, 
+                sigma=4,   
+                p=w_p
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2,
+                contrast_limit=0.2,
+                p=w_p
+            ),
+            A.GaussianBlur(
+                blur_limit=(3, 5),
+                p=w_p
+            ),
         ])
         self.strong_augment = A.Compose([
-            A.GaussNoise(p=s_p),
-            A.RandomBrightnessContrast(p=s_p),
-            A.ColorJitter(p=s_p)
+            A.GaussNoise(
+                var_limit=(10.0, 50.0),
+                p=s_p
+            ),
+            A.ElasticTransform(
+                alpha=40, 
+                sigma=4,   
+                p=s_p
+            ),
+            A.RandomBrightnessContrast(
+                brightness_limit=0.3,
+                contrast_limit=0.3,
+                p=s_p
+            ),
+            A.GaussianBlur(
+                blur_limit=(3, 7),
+                p=s_p
+            ),
+            A.MotionBlur(
+                blur_limit=(3, 7),
+                p=s_p
+            ),
         ])
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                               std=[0.229, 0.224, 0.225])
@@ -230,6 +261,73 @@ class StrongWeakAugment2(torch.utils.data.Dataset):
     def __len__(self):
         return self.num_samples
 
+class StrongWeakAugment4(torch.utils.data.Dataset):
+    def __init__(self, dataset, img_size, use_aug=False, data_path='./proceeded_data/'):
+        super(StrongWeakAugment4, self).__init__()
+        
+        self.dataset = dataset
+        self.root_dir = data_path
+        self.use_aug = use_aug
+
+        self.num_samples = len(self.dataset)
+
+        p = 0.5
+        self.weak_augment = A.Compose([
+            A.Resize(img_size, img_size),
+            A.ElasticTransform(
+                alpha=30, 
+                sigma=4,   
+                p=p
+            ),
+        ])
+        self.strong_augment = A.Compose([
+            A.Resize(img_size, img_size),
+            A.ElasticTransform(
+                alpha=30, 
+                sigma=4,   
+                p=p
+            ),
+        ])
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                              std=[0.229, 0.224, 0.225])
+    
+
+    def __getitem__(self, index):
+        if torch.is_tensor(index):
+            index = index.tolist()
+        sample_name = self.dataset[index]
+        img_path = os.path.join(self.root_dir, f'images/{sample_name}')
+
+        img_data = np.load(img_path)
+
+        img_w = self.weak_augment(image=img_data.astype('uint8'))['image']
+        img_s = self.strong_augment(image=img_w.astype('uint8'))['image']
+        
+        img_w = norm01(img_w)
+        img_s = norm01(img_s)
+       
+        img_w = torch.from_numpy(img_w).float()
+        img_s = torch.from_numpy(img_s).float()
+
+        img_w = img_w.permute(2, 0, 1)
+        org_img = img_w
+        img_s = img_s.permute(2, 0, 1)
+        
+        img_w = self.normalize(img_w)
+        img_s = self.normalize(img_s)
+
+        return{
+            'id': index,
+            'img_w': img_w,
+            'img_s': img_s,
+            'org_img': org_img,
+        }
+
+
+    def __len__(self):
+        return self.num_samples
+
+
 class SkinDataset2(torch.utils.data.Dataset):
     def __init__(self, dataset, img_size, use_aug=False, data_path='./proceeded_data/'):
         super(SkinDataset2, self).__init__()
@@ -243,8 +341,11 @@ class SkinDataset2(torch.utils.data.Dataset):
         p = 0.5
         self.aug_transf = A.Compose([
             A.Resize(img_size, img_size),
-            A.HorizontalFlip(p=p),
-            A.VerticalFlip(p=p),
+            A.ElasticTransform(
+                alpha=30, 
+                sigma=4,   
+                p=p
+            ),
         ])
         self.transf = A.Compose([
             A.Resize(img_size, img_size),
@@ -528,9 +629,6 @@ def get_dataset(args, img_size=384, supervised_ratio=0.2, train_aug=False, k=6, 
     return dataset
 
 
-# need
-# data_path
-# dataset
 
 def get_dataset_without_full_label(args, img_size=384, train_aug=False, k=6, lb_dataset=SkinDataset2, ulb_dataset=StrongWeakAugment2, v_dataset=SkinDataset):
     """
@@ -581,6 +679,50 @@ def get_dataset_without_full_label(args, img_size=384, train_aug=False, k=6, lb_
         'lb_dataset': l_dataset,
         'ulb_dataset': u_dataset,
         'val_dataset': val_dataset
+    }
+
+    return dataset
+
+def get_dataset_without_full_label_without_val(args, img_size=384, train_aug=False, k=6, lb_dataset=SkinDataset2, ulb_dataset=StrongWeakAugment2, v_dataset=SkinDataset):
+    """
+    Hàm này dùng để tạo dataset từ dữ liệu đã được chia sẵn thành labeled và unlabeled
+    Sử dụng dữ liệu train làm validation.
+    """
+    # Đọc danh sách ảnh từ các fold
+    folds = []
+    for idx in range(1, 6):
+        with open(f'{args.data.train_folder}/fold_label_{idx}.txt', 'r') as f:
+            fold_data = [line.replace('\n', '') for line in f.readlines()]
+        folds.append(fold_data)
+            
+    # Lấy tất cả dữ liệu labeled từ các fold
+    l_data = []
+    for fold in folds:
+        l_data.extend(fold)
+            
+    l_data = sorted(l_data)
+    
+    # Đọc danh sách unlabeled data
+    with open(f'{args.data.unlabeled_folder}/unlabeled.txt', 'r') as f:
+        u_data = sorted([line.replace('\n', '') for line in f.readlines()])
+
+    # Kiểm tra dữ liệu
+    if len(l_data) == 0:
+        raise ValueError("No labeled training data found.")
+    if len(u_data) == 0:
+        raise ValueError("No unlabeled training data found.")
+    
+    # Tạo dataset
+    l_dataset = lb_dataset(dataset=l_data, img_size=img_size, use_aug=train_aug, data_path=args.data.train_folder)
+    u_dataset = ulb_dataset(dataset=u_data, img_size=img_size, use_aug=train_aug, data_path=args.data.unlabeled_folder)
+
+
+    print(f'Labeled Data: {l_data[0]} - {len(l_data)}')
+    print(f'Unlabeled Data: {u_data[0]} - {len(u_data)}')
+    
+    dataset = {
+        'lb_dataset': l_dataset,
+        'ulb_dataset': u_dataset,
     }
 
     return dataset
