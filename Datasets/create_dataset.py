@@ -183,8 +183,8 @@ class StrongWeakAugment2(torch.utils.data.Dataset):
         self.weak_augment = A.Compose([
             A.Resize(img_size, img_size),
             A.ElasticTransform(
-                alpha=30, 
-                sigma=4,   
+                alpha=10, 
+                sigma=2,   
                 p=w_p
             ),
             A.RandomBrightnessContrast(
@@ -247,8 +247,8 @@ class StrongWeakAugment2(torch.utils.data.Dataset):
         org_img = img_w
         img_s = img_s.permute(2, 0, 1)
         
-        img_w = self.normalize(img_w)
-        img_s = self.normalize(img_s)
+        # img_w = self.normalize(img_w)
+        # img_s = self.normalize(img_s)
 
         return{
             'id': index,
@@ -271,12 +271,12 @@ class StrongWeakAugment4(torch.utils.data.Dataset):
 
         self.num_samples = len(self.dataset)
 
-        p = 0.5
+        p = 0.3
         self.weak_augment = A.Compose([
             A.Resize(img_size, img_size),
             A.ElasticTransform(
-                alpha=30, 
-                sigma=4,   
+                alpha=10, 
+                sigma=2,   
                 p=p
             ),
         ])
@@ -313,8 +313,8 @@ class StrongWeakAugment4(torch.utils.data.Dataset):
         org_img = img_w
         img_s = img_s.permute(2, 0, 1)
         
-        img_w = self.normalize(img_w)
-        img_s = self.normalize(img_s)
+        # img_w = self.normalize(img_w)
+        # img_s = self.normalize(img_s)
 
         return{
             'id': index,
@@ -338,14 +338,23 @@ class SkinDataset2(torch.utils.data.Dataset):
 
         self.num_samples = len(self.dataset)
 
-        p = 0.5
+        p = 0.3
         self.aug_transf = A.Compose([
             A.Resize(img_size, img_size),
             A.ElasticTransform(
-                alpha=30, 
-                sigma=4,   
+                alpha=10,  # Reduced from 20
+                sigma=2,   # Reduced from 3
                 p=p
             ),
+            A.OneOf([
+                A.GaussNoise(var_limit=(5.0, 20.0), p=p),  # Reduced noise range
+                A.GaussianBlur(blur_limit=(3, 5), p=p),    # Reduced blur range
+                A.MedianBlur(blur_limit=3, p=p)            # Reduced blur limit
+            ], p=p),
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=p),  # Reduced limits
+                A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=p)                        # Reduced clip limit
+            ], p=p)
         ])
         self.transf = A.Compose([
             A.Resize(img_size, img_size),
@@ -370,6 +379,7 @@ class SkinDataset2(torch.utils.data.Dataset):
             tsf = self.transf(image=img_data.astype('uint8'), mask=label_data.astype('uint8'))
         img_data, label_data = tsf['image'], tsf['mask']
         
+        # Bỏ việc chia cho 255 ở đây vì norm01 đã làm việc này rồi
         img_data = norm01(img_data)
         label_data = process_multiclass_label(label_data)
 
@@ -378,8 +388,7 @@ class SkinDataset2(torch.utils.data.Dataset):
 
         img_data = img_data.permute(2, 0, 1)
         org_img = img_data
-        img_data = self.normalize(img_data)
-
+        # img_data = self.normalize(img_data)
 
         return{
             'image': img_data,
