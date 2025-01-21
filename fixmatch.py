@@ -29,13 +29,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from itertools import cycle
 
-from Datasets.create_dataset import get_dataset_without_full_label, SkinDataset2
+from Datasets.create_dataset import get_dataset_without_full_label_without_val, SkinDataset2, StrongWeakAugment2
 from Utils.pieces import DotDict
 from Utils.functions import fix_all_seed
-from Utils.metrics import calc_dice, calc_iou, calc_hd
-from Utils.losses import dice_loss
-from Models.DeepLabV3Plus import deeplabv3plus_resnet50
-from monai.losses import GeneralizedDiceFocalLoss
+
+from Models.DeepLabV3Plus import deeplabv3plus_resnet101
+from monai.losses import DiceCELoss
+from monai.metrics import DiceMetric, HausdorffDistanceMetric, MeanIoU
 
 def main(config):
     """
@@ -45,12 +45,13 @@ def main(config):
         config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label(
+    dataset = get_dataset_without_full_label_without_val(
         config, 
         img_size=config.data.img_size,
         train_aug=config.data.train_aug,
         k=config.fold,
-        lb_dataset=SkinDataset2
+        lb_dataset=SkinDataset2,
+        ulb_dataset=StrongWeakAugment2
     )
     
     l_train_loader = DataLoader(
@@ -74,7 +75,7 @@ def main(config):
     )
     
     val_loader = DataLoader(
-        dataset['val_dataset'],
+        dataset['lb_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
@@ -84,7 +85,7 @@ def main(config):
     )
     
     test_loader = DataLoader(
-        dataset['val_dataset'],
+        dataset['lb_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
@@ -97,7 +98,7 @@ def main(config):
     print(f"Unlabeled batches: {len(u_train_loader)}, Labeled batches: {len(l_train_loader)}")
 
     # Initialize model
-    model = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
 
     # Print model statistics
     total_params = sum(p.numel() for p in model.parameters())
@@ -109,11 +110,11 @@ def main(config):
 
     # Setup loss function - thay đổi criterion
     criterion = [
-        GeneralizedDiceFocalLoss(
+        DiceCELoss(
             include_background=True,
-            to_onehot_y=False,  # Vì labels đã là one-hot
+            to_onehot_y=False,  
             softmax=True
-        )
+        ).cuda()
     ]
     
     # Train and test
@@ -155,10 +156,14 @@ def train_val(config, model, train_loader, val_loader, criterion):
         weight_decay=float(config.train.optimizer.adamw.weight_decay)
     )
     
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
+    # Initialize MONAI metrics for training
+    train_dice = DiceMetric(include_background=True, num_classes=3, reduction="mean")
+    train_iou = MeanIoU(include_background=True, reduction="mean")
+    
     # Training loop
-    max_score = -float('inf')
+    max_dice_score = -float('inf')  # Track the best Dice score
     best_epoch = 0
     w_dice = 0.5  # Weight for Dice score
     w_hd = 0.5    # Weight for HD score
@@ -229,39 +234,34 @@ def train_val(config, model, train_loader, val_loader, criterion):
             
             # Calculate metrics
             with torch.no_grad():
-                output_np = output.argmax(dim=1).cpu().numpy()
-                label_np = label.argmax(dim=1).cpu().numpy()
+                # Convert predictions to one-hot format
+                output_onehot = torch.zeros_like(output)
+                output_onehot.scatter_(1, output.argmax(dim=1, keepdim=True), 1)
                 
-                # Calculate per-class metrics
-                batch_dice = 0
-                batch_iou = 0
-                num_classes = output.shape[1]
+                # Update MONAI metrics
+                train_dice(y_pred=output_onehot, y=label)
+                train_iou(y_pred=output_onehot, y=label)
                 
-                for i in range(num_classes):
-                    if i > 0:  # Skip background class
-                        batch_dice += calc_dice(output_np == i, label_np == i)
-                        batch_iou += calc_iou(output_np == i, label_np == i)
-                
-                # Average across foreground classes
-                num_fg_classes = num_classes - 1
-                batch_dice /= num_fg_classes
-                batch_iou /= num_fg_classes
-                
-                # Update running averages
-                train_metrics['dice'] = (train_metrics['dice'] * num_train + batch_dice * sup_batch_len) / (num_train + sup_batch_len)
-                train_metrics['iou'] = (train_metrics['iou'] * num_train + batch_iou * sup_batch_len) / (num_train + sup_batch_len)
+                # Update loss metric
                 train_metrics['loss'] = (train_metrics['loss'] * num_train + loss.item() * sup_batch_len) / (num_train + sup_batch_len)
-                
                 num_train += sup_batch_len
             
-            # Update progress bar
+            # Update progress bar with current batch metrics
             train_loop.set_postfix({
                 'Loss': f"{loss.item():.4f}",
-                'Dice': f"{train_metrics['dice']:.4f}"
+                'Dice': f"{train_dice.aggregate().item():.4f}"
             })
             
             if config.debug:
                 break
+        
+        # Get final training metrics for the epoch
+        train_metrics['dice'] = train_dice.aggregate().item()
+        train_metrics['iou'] = train_iou.aggregate().item()
+        
+        # Reset metrics for next epoch
+        train_dice.reset()
+        train_iou.reset()
         
         # Log training metrics
         log_message = (f'Epoch {epoch}, Total train steps {idx} || '
@@ -275,20 +275,14 @@ def train_val(config, model, train_loader, val_loader, criterion):
         # Validation phase
         val_metrics = validate_model(model, val_loader, criterion)
         
-        # Calculate combined score
-        hd_norm = np.exp(-val_metrics['hd']/100)
-        combined_score = w_dice * val_metrics['dice'] + w_hd * hd_norm
-        
-        # Save best model
-        if combined_score > max_score and epoch >= 30:
-            max_score = combined_score
+        # Save best model based on Dice score
+        if val_metrics['dice'] > max_dice_score and epoch >= 20:
+            max_dice_score = val_metrics['dice']
             best_epoch = epoch
             torch.save(model.state_dict(), best_model_dir)
             
             message = (f'New best epoch {epoch}! '
-                      f'Score: {combined_score:.4f} '
-                      f'Dice: {val_metrics["dice"]:.4f} '
-                      f'HD: {val_metrics["hd"]:.4f}')
+                      f'Dice: {val_metrics["dice"]:.4f}')
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
@@ -298,8 +292,8 @@ def train_val(config, model, train_loader, val_loader, criterion):
         
         # Log epoch time
         time_elapsed = time.time() - start
-        print(f'Epoch {epoch} completed in {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
-        
+        print(f'Epoch {epoch} completed in {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s\n')
+        print('='*80)
         if config.debug:
             break
     
@@ -307,19 +301,16 @@ def train_val(config, model, train_loader, val_loader, criterion):
 
 def validate_model(model, val_loader, criterion):
     """
-    Validate model performance.
-    
-    Args:
-        model: Model to validate
-        val_loader: Validation data loader
-        criterion: Loss functions
-    
-    Returns:
-        Dictionary containing validation metrics
+    Validate model using MONAI metrics.
     """
     model.eval()
     metrics = {'dice': 0, 'iou': 0, 'hd': 0, 'loss': 0}
     num_val = 0
+    
+    # Initialize MONAI metrics
+    dice_metric = DiceMetric(include_background=True, num_classes=3, reduction="mean")
+    iou_metric = MeanIoU(include_background=True, reduction="mean")
+    hd_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0)
     
     val_loop = tqdm(val_loader, desc='Validation', leave=False)
     for batch in val_loop:
@@ -331,39 +322,42 @@ def validate_model(model, val_loader, criterion):
             output = model(img)
             loss = criterion[0](output, label)
             
-            # Calculate metrics
-            output_np = output.argmax(dim=1).cpu().numpy()
-            label_np = label.argmax(dim=1).cpu().numpy()
+            # Convert predictions to one-hot format
+            preds = torch.argmax(output, dim=1, keepdim=True)
+            preds_onehot = torch.zeros_like(output)
+            preds_onehot.scatter_(1, preds, 1)
             
-            batch_dice = 0
-            batch_iou = 0
-            batch_hd = 0
-            num_classes = output.shape[1]
+            # Convert labels to one-hot format if needed
+            if len(label.shape) == 4:  # If already one-hot
+                labels_onehot = label
+            else:  # If not one-hot
+                labels_onehot = torch.zeros_like(output)
+                labels_onehot.scatter_(1, label.unsqueeze(1), 1)
+                
+            # Compute metrics
+            dice_metric(y_pred=preds_onehot, y=labels_onehot)
+            iou_metric(y_pred=preds_onehot, y=labels_onehot)
+            hd_metric(y_pred=preds_onehot, y=labels_onehot)
             
-            for i in range(num_classes):
-                if i > 0:  # Skip background
-                    batch_dice += calc_dice(output_np == i, label_np == i)
-                    batch_iou += calc_iou(output_np == i, label_np == i)
-                    batch_hd += calc_hd(output_np == i, label_np == i)
-            
-            # Average across foreground classes
-            num_fg_classes = num_classes - 1
-            batch_dice /= num_fg_classes
-            batch_iou /= num_fg_classes
-            batch_hd /= num_fg_classes
-            
-            # Update running averages
-            metrics['dice'] = (metrics['dice'] * num_val + batch_dice * batch_len) / (num_val + batch_len)
-            metrics['iou'] = (metrics['iou'] * num_val + batch_iou * batch_len) / (num_val + batch_len)
-            metrics['hd'] = (metrics['hd'] * num_val + batch_hd * batch_len) / (num_val + batch_len)
+            # Update loss
             metrics['loss'] = (metrics['loss'] * num_val + loss.item() * batch_len) / (num_val + batch_len)
-            
             num_val += batch_len
             
             val_loop.set_postfix({
                 'Loss': f"{loss.item():.4f}",
-                'Dice': f"{metrics['dice']:.4f}"
+                'Dice': f"{dice_metric.aggregate().item():.4f}"
             })
+    
+    # Aggregate metrics
+    metrics['dice'] = dice_metric.aggregate().item()
+    metrics['iou'] = iou_metric.aggregate().item()
+    metrics['hd'] = hd_metric.aggregate().item()
+        
+
+    # Reset metrics for next validation
+    dice_metric.reset()
+    iou_metric.reset()
+    hd_metric.reset()
     
     return metrics
 
@@ -440,7 +434,7 @@ if __name__ == '__main__':
     config = DotDict(config)
     
     # Train each fold
-    for fold in [1, 2, 3, 4, 5]:
+    for fold in [1]:
         print(f"\n=== Training Fold {fold} ===")
         config['fold'] = fold
         
