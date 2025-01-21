@@ -1,19 +1,3 @@
-"""
-Cross Pseudo Supervision (CPS) training implementation for medical image segmentation.
-Uses DeepLabV3+ with ResNet50 backbone and GeneralizedDiceFocalLoss.
-
-Example usage:
-nohup python -u multi_train_adapt.py \
-    --exp_name test \
-    --config_yml Configs/multi_train_local.yml \
-    --model MedFormer \
-    --batch_size 16 \
-    --adapt_method False \
-    --num_domains 1 \
-    --dataset PH2 \
-    --k_fold 4 > 4MedFormer_PH2.out 2>&1 &
-"""
-
 import os
 import time
 import argparse
@@ -29,13 +13,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from itertools import cycle
-from monai.losses import GeneralizedDiceFocalLoss
+from monai.losses import *
+from monai.metrics import *
 
-from Datasets.create_dataset import get_dataset_without_full_label, SkinDataset2, StrongWeakAugment4
+from Datasets.create_dataset import *
+from Models.DeepLabV3Plus.modeling import deeplabv3plus_resnet50
+from Models.DeepLabV3Plus.modeling import deeplabv3plus_resnet101
+from Models.Transformer.SwinUnet import SwinUnet
 from Utils.pieces import DotDict
 from Utils.functions import fix_all_seed
-from Utils.metrics import calc_dice, calc_iou, calc_hd
-from Models.DeepLabV3Plus import deeplabv3plus_resnet50
 
 def main(config):
     """
@@ -45,7 +31,7 @@ def main(config):
         config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label(
+    dataset = get_dataset_without_full_label_without_val(
         config, 
         img_size=config.data.img_size,
         train_aug=config.data.train_aug,
@@ -54,14 +40,14 @@ def main(config):
         ulb_dataset=StrongWeakAugment4
     )
     
+    
+    
     l_train_loader = DataLoader(
         dataset['lb_dataset'],
         batch_size=config.train.l_batchsize,
         shuffle=True,
         num_workers=config.train.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=True
     )
     
     u_train_loader = DataLoader(
@@ -69,37 +55,36 @@ def main(config):
         batch_size=config.train.u_batchsize,
         shuffle=True,
         num_workers=config.train.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=True
     )
     
     val_loader = DataLoader(
-        dataset['val_dataset'],
+        dataset['lb_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=True
     )
     
     test_loader = DataLoader(
-        dataset['val_dataset'],
+        dataset['lb_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        pin_memory=True
     )
     
     train_loader = {'l_loader': l_train_loader, 'u_loader': u_train_loader}
     print(f"Unlabeled batches: {len(u_train_loader)}, Labeled batches: {len(l_train_loader)}")
 
     # Initialize models
-    model1 = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
-    model2 = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
+    
+    model1 = SwinUnet(224, num_classes=3)
+    model2 = SwinUnet(224, num_classes=3)
+    
+    
+    # model1 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
+    # model2 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
 
     # Print model statistics
     total_params = sum(p.numel() for p in model1.parameters())
@@ -114,8 +99,9 @@ def main(config):
     criterion = GeneralizedDiceFocalLoss(
         include_background=True,
         to_onehot_y=False,
-        softmax=True
-    )
+        softmax=True,
+        reduction='mean'
+    ).cuda()
     criterion = [criterion]
     
     global loss_weights
@@ -198,12 +184,13 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
     scheduler1 = optim.lr_scheduler.StepLR(optimizer1, step_size=20, gamma=0.5)
     scheduler2 = optim.lr_scheduler.StepLR(optimizer2, step_size=20, gamma=0.5)
 
-    # Training loop
-    max_score = -float('inf')
+    # Initialize MONAI metrics for training
+    train_dice_1 = DiceMetric(include_background=True, reduction="mean")
+    train_dice_2 = DiceMetric(include_background=True, reduction="mean")
+    
+    max_dice = -float('inf')  # Khởi tạo giá trị Dice tốt nhất
     best_epoch = 0
-    w_dice = 0.5  # Weight for Dice score
-    w_hd = 0.5    # Weight for HD score
-    model = model1  # Default model to return
+    model = model1
     
     torch.save(model.state_dict(), best_model_dir)
     
@@ -214,14 +201,16 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         model1.train()
         model2.train()
         train_metrics = {
-            'dice_1': 0, 'iou_1': 0, 'hd_1': 0,
-            'dice_2': 0, 'iou_2': 0, 'hd_2': 0,
-            'loss': 0
+            'dice_1': 0, 'dice_2': 0, 'loss': 0
         }
         num_train = 0
         
         source_dataset = zip(cycle(train_loader['l_loader']), train_loader['u_loader'])
         train_loop = tqdm(source_dataset, desc=f'Epoch {epoch} Training', leave=False)
+        
+        # Reset metrics at start of epoch
+        train_dice_1.reset()
+        train_dice_2.reset()
         
         for idx, (batch, batch_w_s) in enumerate(train_loop):
             # Get batch data
@@ -276,63 +265,52 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
             
             # Calculate metrics
             with torch.no_grad():
-                output1_np = output1.argmax(dim=1).cpu().numpy()
-                output2_np = output2.argmax(dim=1).cpu().numpy()
-                label_np = label.argmax(dim=1).cpu().numpy()
+                # Convert predictions to one-hot format
+                output1_onehot = torch.zeros_like(output1)
+                output1_onehot.scatter_(1, output1.argmax(dim=1, keepdim=True), 1)
                 
-                # Reset batch metrics
-                batch_dice_1 = 0
-                batch_dice_2 = 0
-                num_classes = output1.shape[1]
+                output2_onehot = torch.zeros_like(output2)
+                output2_onehot.scatter_(1, output2.argmax(dim=1, keepdim=True), 1)
                 
-                # Calculate average Dice score across classes
-                for i in range(num_classes):
-                    batch_dice_1 += calc_dice(output1_np == i, label_np == i)
-                    batch_dice_2 += calc_dice(output2_np == i, label_np == i)
+                # Update MONAI metrics
+                train_dice_1(y_pred=output1_onehot, y=label)
+                train_dice_2(y_pred=output2_onehot, y=label)
                 
-                # Average across classes
-                batch_dice_1 /= num_classes
-                batch_dice_2 /= num_classes
-                
-                # Update running averages
-                train_metrics['dice_1'] = (train_metrics['dice_1'] * num_train + batch_dice_1 * sup_batch_len) / (num_train + sup_batch_len)
-                train_metrics['dice_2'] = (train_metrics['dice_2'] * num_train + batch_dice_2 * sup_batch_len) / (num_train + sup_batch_len)
+                # Update loss metric
                 train_metrics['loss'] = (train_metrics['loss'] * num_train + loss.item() * sup_batch_len) / (num_train + sup_batch_len)
-                
                 num_train += sup_batch_len
             
-            # Update progress bar
+            # Update progress bar with current batch metrics
             train_loop.set_postfix({
                 'Loss': f"{loss.item():.4f}",
-                'Dice1': f"{train_metrics['dice_1']:.4f}",
-                'Dice2': f"{train_metrics['dice_2']:.4f}"
+                'Dice1': f"{train_dice_1.aggregate().item():.4f}",
+                'Dice2': f"{train_dice_2.aggregate().item():.4f}"
             })
             
             if config.debug:
                 break
         
+        # Get final training metrics for the epoch
+        train_metrics['dice_1'] = train_dice_1.aggregate().item()
+        train_metrics['dice_2'] = train_dice_2.aggregate().item()
+        
         # Validation phase for both models
         val_metrics_1 = validate_model(model1, val_loader, criterion)
         val_metrics_2 = validate_model(model2, val_loader, criterion)
         
-        # Select better model based on combined score
-        score_1 = w_dice * val_metrics_1['dice'] + w_hd * np.exp(-val_metrics_1['hd']/100)
-        score_2 = w_dice * val_metrics_2['dice'] + w_hd * np.exp(-val_metrics_2['hd']/100)
+        # Chọn mô hình có Dice cao hơn
+        current_dice = max(val_metrics_1['dice'], val_metrics_2['dice'])
+        current_model = model1 if val_metrics_1['dice'] > val_metrics_2['dice'] else model2
         
-        current_score = max(score_1, score_2)
-        current_model = model1 if score_1 > score_2 else model2
-        
-        # Save best model
-        if current_score > max_score and epoch >= 20:
-            max_score = current_score
+        # Lưu mô hình nếu Dice hiện tại cao hơn Dice tốt nhất
+        if current_dice > max_dice:
+            max_dice = current_dice
             best_epoch = epoch
             model = current_model
             torch.save(model.state_dict(), best_model_dir)
             
             message = (f'New best epoch {epoch}! '
-                      f'Score: {current_score:.4f} '
-                      f'Dice: {val_metrics_1["dice"]:.4f} '
-                      f'HD: {val_metrics_1["hd"]:.4f}')
+                      f'Dice: {current_dice:.4f}')
             print(message)
             file_log.write(message + '\n')
             file_log.flush()
@@ -353,7 +331,7 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
 
 def validate_model(model, val_loader, criterion):
     """
-    Validate a single model.
+    Validate a single model using MONAI metrics.
     
     Args:
         model: Model to validate
@@ -367,6 +345,11 @@ def validate_model(model, val_loader, criterion):
     metrics = {'dice': 0, 'iou': 0, 'hd': 0, 'loss': 0}
     num_val = 0
     
+    # Initialize MONAI metrics
+    dice_metric = DiceMetric(include_background=True, reduction="mean")
+    iou_metric = MeanIoU(include_background=True, reduction="mean")
+    hd_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0)
+    
     val_loop = tqdm(val_loader, desc='Validation', leave=False)
     for batch in val_loop:
         img = batch['image'].cuda().float()
@@ -377,37 +360,40 @@ def validate_model(model, val_loader, criterion):
             output = torch.softmax(model(img), dim=1)
             loss = criterion[0](output, label)
             
-            output_np = output.argmax(dim=1).cpu().numpy()
-            label_np = label.argmax(dim=1).cpu().numpy()
+            # Convert predictions to one-hot format
+            preds = torch.argmax(output, dim=1, keepdim=True)
+            preds_onehot = torch.zeros_like(output)
+            preds_onehot.scatter_(1, preds, 1)
             
-            # Calculate average metrics for batch
-            batch_dice = 0
-            batch_iou = 0
-            batch_hd = 0
-            num_classes = output.shape[1]
+            # Convert labels to one-hot format if needed
+            if len(label.shape) == 4:  # If already one-hot
+                labels_onehot = label
+            else:  # If not one-hot
+                labels_onehot = torch.zeros_like(output)
+                labels_onehot.scatter_(1, label.unsqueeze(1), 1)
             
-            for i in range(num_classes):
-                batch_dice += calc_dice(output_np == i, label_np == i)
-                batch_iou += calc_iou(output_np == i, label_np == i)
-                batch_hd += calc_hd(output_np == i, label_np == i)
+            # Compute metrics
+            dice_metric(y_pred=preds_onehot, y=labels_onehot)
+            iou_metric(y_pred=preds_onehot, y=labels_onehot)
+            hd_metric(y_pred=preds_onehot, y=labels_onehot)
             
-            # Average across classes
-            batch_dice /= num_classes
-            batch_iou /= num_classes
-            batch_hd /= num_classes
-            
-            # Update running averages
-            metrics['dice'] = (metrics['dice'] * num_val + batch_dice * batch_len) / (num_val + batch_len)
-            metrics['iou'] = (metrics['iou'] * num_val + batch_iou * batch_len) / (num_val + batch_len)
-            metrics['hd'] = (metrics['hd'] * num_val + batch_hd * batch_len) / (num_val + batch_len)
+            # Update loss
             metrics['loss'] = (metrics['loss'] * num_val + loss.item() * batch_len) / (num_val + batch_len)
-            
             num_val += batch_len
             
             val_loop.set_postfix({
-                'Loss': f"{loss.item():.4f}",
-                'Dice': f"{metrics['dice']:.4f}"
+                'Loss': f"{loss.item():.4f}"
             })
+    
+    # Aggregate metrics
+    metrics['dice'] = dice_metric.aggregate().item()
+    metrics['iou'] = iou_metric.aggregate().item()
+    metrics['hd'] = hd_metric.aggregate().item()
+    
+    # Reset metrics for next validation
+    dice_metric.reset()
+    iou_metric.reset()
+    hd_metric.reset()
     
     return metrics
 
@@ -487,7 +473,7 @@ if __name__=='__main__':
     store_config = config
     config = DotDict(config)
     
-    folds_to_train = [1,2,3,4,5]
+    folds_to_train = [1]
     
     for fold in folds_to_train:
         print(f"\n=== Training Fold {fold} ===")
