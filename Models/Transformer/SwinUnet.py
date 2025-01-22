@@ -878,23 +878,3 @@ class SwinUnet(nn.Module):
 
             msg = self.swin_unet.load_state_dict(full_dict, strict=False)
 
-
-
-if __name__ == '__main__':
-    x = torch.randn(5,3,224,224)
-    model = SwinUnet(img_size=224)
-
-    y = model(x)
-    print(y.shape)
-    # for i in y:
-    #     print(i.shape)
-
-    from fvcore.nn import FlopCountAnalysis, ActivationCountAnalysis
-
-    # flops = FlopCountAnalysis(model, x)
-    param = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # acts = ActivationCountAnalysis(model, x)
-
-    # print(f"total flops : {flops.total()/1e12} M")
-    # print(f"total activations: {acts.total()/1e6} M")
-    print(f"number of parameter: {param/1e6} M")
