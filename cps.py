@@ -17,9 +17,7 @@ from monai.losses import *
 from monai.metrics import *
 
 from Datasets.create_dataset import *
-from Models.DeepLabV3Plus.modeling import deeplabv3plus_resnet50
-from Models.DeepLabV3Plus.modeling import deeplabv3plus_resnet101
-from Models.Transformer.SwinUnet import SwinUnet
+from Models.DeepLabV3Plus.modeling import *
 from Utils.pieces import DotDict
 from Utils.functions import fix_all_seed
 
@@ -39,9 +37,7 @@ def main(config):
         lb_dataset=SkinDataset2,
         ulb_dataset=StrongWeakAugment4
     )
-    
-    
-    
+      
     l_train_loader = DataLoader(
         dataset['lb_dataset'],
         batch_size=config.train.l_batchsize,
@@ -79,12 +75,8 @@ def main(config):
 
     # Initialize models
     
-    model1 = SwinUnet(224, num_classes=3)
-    model2 = SwinUnet(224, num_classes=3)
-    
-    
-    # model1 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
-    # model2 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model1 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model2 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
 
     # Print model statistics
     total_params = sum(p.numel() for p in model1.parameters())
