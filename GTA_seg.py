@@ -29,7 +29,7 @@ def main(config):
         config: Configuration object containing training parameters
     """
     # Setup datasets and dataloaders
-    dataset = get_dataset_without_full_label_without_val(
+    dataset = get_dataset_without_full_label(
         config, 
         img_size=config.data.img_size,
         train_aug=config.data.train_aug,
@@ -55,7 +55,7 @@ def main(config):
     )
     
     val_loader = DataLoader(
-        dataset['lb_dataset'],
+        dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
@@ -63,7 +63,7 @@ def main(config):
     )
     
     test_loader = DataLoader(
-        dataset['lb_dataset'],
+        dataset['val_dataset'],
         batch_size=config.test.batch_size,
         shuffle=False,
         num_workers=config.test.num_workers,
