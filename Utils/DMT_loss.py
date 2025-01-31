@@ -17,62 +17,36 @@ import torch.nn as nn
 import torchvision.transforms.functional as transforms_f
 
 
-def compute_cutmix(h, w, imgs, labels, criterion, model, ema_model, image_u, threshold):
-    
+def compute_cutmix(imgs, labels, criterion, model, ema_model, image_u, threshold):
     with torch.no_grad():
         pred = ema_model(image_u)
-        pred = F.interpolate(pred, (h, w), mode="bilinear", align_corners=False)
-        pred = torch.sigmoid(pred)  # Apply sigmoid for binary segmentation
-        pred_label = (pred > threshold).float()  # Binarize predictions based on the threshold
+        pred = F.softmax(pred, dim=1)
+        pred_logit, pred_label = torch.max(pred, dim=1)
 
-    # Generate augmented images and labels
     image_aug, label_aug = cut_mixer(image_u, pred_label.clone())
-    image_aug, label_aug, pred = batch_transform(
-        image_aug, label_aug, pred,
-        crop_size=(pred.shape[2], pred.shape[3]), scale_size=(1.0, 1.0), apply_augmentation=True
-    )
+
+    image_aug, label_aug, pred_logit = \
+        batch_transform(image_aug, label_aug, pred_logit,
+                        crop_size=(pred_logit.shape[1], pred_logit.shape[2]), scale_size=(1.0, 1.0), apply_augmentation=True)
 
     num_labeled = len(imgs)
     outputs = model(torch.cat([imgs, image_aug]))
     outputs, outputs_u = outputs[:num_labeled], outputs[num_labeled:]
-# Đảm bảo labels có chiều kênh phù hợp
-    if labels.dim() == 3:  # labels có dạng (N, H, W)
-        labels = labels.unsqueeze(1)  # Thêm chiều channel -> (N, 1, H, W)
+    sup_loss = criterion(outputs, labels.type(torch.long).clone())
 
-    # Interpolate outputs để khớp kích thước với labels
-    outputs_labeled = torch.sigmoid(
-        F.interpolate(outputs, size=labels.shape[2:], mode='bilinear', align_corners=False)
-    )
-
-    bce_loss = criterion[0](outputs_labeled, labels)
-    dice_loss_value = criterion[1](outputs_labeled, labels)
-    sup_loss = bce_loss + dice_loss_value
-
-    # Compute unsupervised loss
-    pred_u = torch.sigmoid(F.interpolate(outputs_u, (h, w), mode="bilinear", align_corners=False))
-    cutmix_loss = compute_unsupervised_loss(pred_u, label_aug.clone(), pred, threshold)
-    
+    cutmix_loss = compute_unsupervised_loss(outputs_u, label_aug.clone(), pred_logit, threshold)
     return sup_loss + cutmix_loss
 
 
 def tensor_to_pil(im, label, logits):
-    # Denormalize the image tensor
     im = denormalise(im)
-    im = transforms_f.to_pil_image(im.cpu())  # Convert to PIL image
+    im = transforms_f.to_pil_image(im.cpu())
 
-    # Process the label tensor
-    if label.ndimension() == 4:  # If batch, take the first sample
-        label = label[0]
-    label = label.float() / 255.  # Normalize
-    label = transforms_f.to_pil_image(label.cpu())  # Convert to PIL image
+    label = label.float() / 255.
+    label = transforms_f.to_pil_image(label.unsqueeze(0).cpu())
 
-    # Process the logits tensor
-    if logits.ndimension() == 4:  # If batch, take the first sample
-        logits = logits[0]
-    logits = transforms_f.to_pil_image(logits.cpu())  # Convert to PIL image
-
+    logits = transforms_f.to_pil_image(logits.unsqueeze(0).cpu())
     return im, label, logits
-
 
 
 def denormalise(x, imagenet=True):
@@ -84,7 +58,7 @@ def denormalise(x, imagenet=True):
         return (x + 1) / 2
 
 
-def transform(image, label, logits=None, crop_size=(32, 32), scale_size=(0.8, 1.0), augmentation=True):
+def transform(image, label, logits=None, crop_size=(512, 512), scale_size=(0.8, 1.0), augmentation=True):
     # Random rescale image
     raw_w, raw_h = image.size
     scale_ratio = random.uniform(scale_size[0], scale_size[1])
@@ -165,29 +139,13 @@ def batch_transform(data, label, logits, crop_size, scale_size, apply_augmentati
     return data_trans, label_trans, logits_trans
 
 
-def compute_unsupervised_loss(predict, target, logits, threshold):
-    # Compute valid mask
-    valid_mask = (target >= 0).float()  # Ensure only valid pixels are considered
-    threshold_mask = (logits > threshold).float()  # Mask for confident predictions
-
-    # Convert target to float if not already in that type
-    target = target.float()
-
-    # Add extra channel dimension to target to match the input size
-    target = target.unsqueeze(1)  # Add channel dimension if missing
-
-    # Compute BCE loss for unsupervised targets
-    bce_loss = F.binary_cross_entropy_with_logits(
-        predict, target, reduction='none'
-    )  # Raw BCE loss without reduction
-    bce_loss = bce_loss * valid_mask * threshold_mask  # Mask invalid and low-confidence pixels
-
-    # Compute final loss
-    num_valid_pixels = valid_mask.sum()
-    weighted_loss = bce_loss.sum() / (num_valid_pixels + 1e-8)  # Normalize by valid pixel count
-
+def compute_unsupervised_loss(predict, target, logits, strong_threshold):
+    batch_size = predict.shape[0]
+    valid_mask = (target >= 0).float()  # only count valid pixels
+    weighting = logits.view(batch_size, -1).ge(strong_threshold).sum(-1) / valid_mask.view(batch_size, -1).sum(-1)
+    loss = F.cross_entropy(predict, target, reduction='none', ignore_index=255)
+    weighted_loss = torch.mean(torch.masked_select(weighting[:, None, None] * loss, loss > 0))
     return weighted_loss
-
 
 
 def rand_bbox_1(size, lam=None):
@@ -229,99 +187,72 @@ def cut_mixer(data, target):
     torch.cuda.empty_cache()
     return mix_data, mix_target.squeeze(dim=1)
 
+
 def get_bin_mask(b, argmax_occluder):
     for image_i in range(b):
-        unique_vals = torch.unique(argmax_occluder[image_i])
+        classes = torch.unique(argmax_occluder[image_i])
 
-        # Bỏ qua giá trị không hợp lệ (nếu có)
-        unique_vals = unique_vals[unique_vals != 255]
-        if len(unique_vals) == 1:  # Chỉ có một lớp foreground/background
-            classes = unique_vals
-        else:
-            nclasses = len(unique_vals)
-            classes = (unique_vals[torch.randperm(nclasses)[:nclasses // 2]]).cuda()
-
+        classes = classes[classes != 255]
+        nclasses = classes.shape[0]
+        classes = (classes[torch.Tensor(np.random.choice(nclasses, int((nclasses - nclasses % 2) / 2), replace=False)).long()]).cuda()
         if image_i == 0:
             binary_mask = generate_class_mask(argmax_occluder[image_i], classes).unsqueeze(0).cuda()
         else:
-            binary_mask = torch.cat(
-                (binary_mask, generate_class_mask(argmax_occluder[image_i], classes).unsqueeze(0).cuda())
-            )
+            binary_mask = torch.cat((binary_mask, generate_class_mask(argmax_occluder[image_i], classes).unsqueeze(0).cuda()))
     return binary_mask
 
 
-def compute_classmix(b, h, w, criterion, cm_loss_fn, model, ema_model, imgs, labels, unsup_imgs, image_u_strong, threshold):
+def compute_classmix(criterion, cm_loss_fn, model, ema_model, imgs, labels, unsup_imgs, image_u_strong, threshold):
     # Unlabeled Process
     with torch.no_grad():
         logits_occluder = ema_model(unsup_imgs)
-        logits_occluder = F.interpolate(logits_occluder, (h, w), mode="bilinear", align_corners=False)
-        sigmoid_occluder = torch.sigmoid(logits_occluder)  # Binary segmentation prediction
-        argmax_occluder = (sigmoid_occluder > threshold).float()  # Thresholding to binary
+        softmax_occluder = torch.softmax(logits_occluder, dim=1)
+        max_prob_occluder, argmax_occluder = torch.max(softmax_occluder, dim=1)
 
+    b = unsup_imgs.shape[0]
     binary_mask = get_bin_mask(b, argmax_occluder)
     binary_mask = binary_mask.squeeze(dim=1)
-
     if b == 2:
         shuffle_index = torch.tensor([1, 0])
     else:
         shuffle_index = torch.randperm(b).cuda()
-
-    # Create Class-Mixed Images
     class_mixed_img = class_mix(occluder_mask=binary_mask, occluder=image_u_strong, occludee=image_u_strong[shuffle_index])
 
     num_labeled = len(imgs)
     outputs = model(torch.cat([imgs, class_mixed_img]))
     outputs, outputs_u = outputs[:num_labeled], outputs[num_labeled:]
 
-    # Compute Supervised Loss
-    pred_large = torch.sigmoid(
-        F.interpolate(outputs, size=labels.shape[2:], mode='bilinear', align_corners=False)
-    )
-
-
-    bce_loss = criterion[0](pred_large, labels)
-    dice_loss_value = criterion[1](pred_large, labels)
-    sup_loss = bce_loss + dice_loss_value
-
-    del outputs, pred_large
+    sup_loss = criterion(outputs, labels.type(torch.long).clone())
+    del outputs
     torch.cuda.empty_cache()
 
-    # Compute Unsupervised Loss
-    logits_class_mixed = F.interpolate(outputs_u, (h, w), mode="bilinear", align_corners=False)
-    sigmoid_class_mixed = torch.sigmoid(logits_class_mixed)
+    class_mixed_softmax = class_mix(occluder_mask=binary_mask, occluder=softmax_occluder, occludee=softmax_occluder[shuffle_index])
+    max_prob_occluder, pseudo_label = torch.max(class_mixed_softmax, dim=1)
 
-    # Create Pseudo Labels
-    class_mixed_mask = class_mix(occluder_mask=binary_mask, occluder=sigmoid_occluder, occludee=sigmoid_occluder[shuffle_index])
-    pseudo_label = (class_mixed_mask > threshold).float()
+    unlabeled_weight = torch.sum(max_prob_occluder.ge(threshold).long() == 1).item() / np.size(np.array(pseudo_label.cpu()))
+    pixel_weight = unlabeled_weight * torch.ones(max_prob_occluder.shape).cuda()
 
-    # Calculate Weight for Unlabeled Loss
-    unlabeled_weight = torch.sum(class_mixed_mask.ge(threshold).float()) / class_mixed_mask.numel()
-    pixel_weight = unlabeled_weight * torch.ones_like(class_mixed_mask).cuda()
-
-    # Compute Class-Mix Loss
-    class_mix_loss = cm_loss_fn(sigmoid_class_mixed, pseudo_label, pixel_weight)
+    class_mix_loss = cm_loss_fn(outputs_u, pseudo_label, pixel_weight)
     loss = sup_loss + class_mix_loss
     return loss
 
 
 def class_mix(occluder_mask, occluder, occludee):
-    if occluder.dim() == 4 and occluder.shape[1] == 1:  # Single-channel binary mask
-        occluder_mask = occluder_mask.unsqueeze(dim=1)  # Expand to match dimensions
+    if occluder.dim() == 4 and occluder.shape[1] == 3:  # Image
+        occluder_mask = occluder_mask.unsqueeze(dim=1).repeat(1, 3, 1, 1)
+    elif occluder.dim() == 4 and occluder.shape[1] == 150:  # Image
+        occluder_mask = occluder_mask.unsqueeze(dim=1).repeat(1, 150, 1, 1)
 
-    # Blend images based on the occluder mask
-    mixed_data = occluder_mask.float() * occluder + (1 - occluder_mask.float()) * occludee
+    masked_data = occluder_mask.float() * occluder + (1 - occluder_mask.float()) * occludee
     del occluder_mask, occluder, occludee
     torch.cuda.empty_cache()
-    return mixed_data
+    return masked_data
 
 
 def generate_class_mask(pred, classes):
-    # Generate binary mask for specific classes
-    binary_mask = torch.zeros_like(pred, dtype=torch.bool)  # Initialize as boolean
-    for c in classes:
-        binary_mask = binary_mask | (pred == c)
-    return binary_mask.float()  # Convert to float if needed for downstream operations
-
+    pred, classes = torch.broadcast_tensors(pred.unsqueeze(0), classes.unsqueeze(1).unsqueeze(2))
+    binary_mask = pred.eq(classes).sum(0)
+    return binary_mask
 
 
 def blur(img, p=0.5):
@@ -331,45 +262,30 @@ def blur(img, p=0.5):
     return img
 
 
-def compute_ic(model, ema_model, image_u, image_u_strong, criterion, label_u, h, w, threshold):
+def compute_ic(model, ema_model, image_u, image_u_strong, criterion_u, label_u, threshold):
     with torch.no_grad():
-        # Predict using EMA model on unlabeled image
-        logits = ema_model(image_u)  # Logits output from EMA model
-        logits = F.interpolate(logits, (h, w), mode="bilinear", align_corners=False)  # Resize to standard size
-        probs = torch.sigmoid(logits)  # Compute probabilities for each pixel (for binary segmentation)
-        max_probs = probs.squeeze(1)  # Remove channel dimension [B, H, W]
-        argmax_label = (max_probs >= threshold).float()  # Binarize based on threshold
-
-    # Predict using current model on strongly augmented image
-    pred_dc = model(image_u_strong) 
-    pred_dc = F.interpolate(pred_dc, (h, w), mode="bilinear", align_corners=False)
+        logits = ema_model(image_u)
+        softmax_out = torch.softmax(logits, dim=1)
+        max_probs, argmax_label = torch.max(softmax_out, dim=1)
+    pred_dc = model(image_u_strong)
+    loss_dc = criterion_u(pred_dc, argmax_label)
     
-    # Modify to use BCE Loss
-    loss_dc = F.binary_cross_entropy_with_logits(
-        pred_dc.squeeze(1), 
-        argmax_label, 
-        reduction='none'
-    )
+    # Create confidence mask
+    conf_mask = max_probs >= threshold
     
-    # Create mask for valid pixels (above threshold and not ignore label)
-    mask = ((max_probs >= threshold) & (label_u != 255))
-    loss_dc = loss_dc * mask.float()  
-    loss_dc = loss_dc.sum() / (mask.sum().item() + 1e-8)  # Add small epsilon to prevent division by zero
+    # Apply mask and calculate mean
+    loss_dc = loss_dc[conf_mask]
+    loss_dc = loss_dc.mean() if loss_dc.numel() > 0 else torch.tensor(0.0).cuda()
     
     return loss_dc.clone()
 
 
 class ClassMixLoss(nn.Module):
-    def __init__(self, weight=None, reduction='none'):
+    def __init__(self, weight=None, reduction=None, ignore_index=None):
         super(ClassMixLoss, self).__init__()
-        self.BCE = nn.BCEWithLogitsLoss(weight=weight, reduction=reduction)
+        self.CE = nn.CrossEntropyLoss(weight=weight, reduction=reduction, ignore_index=ignore_index)
 
     def forward(self, output, target, pixel_weight):
-        if target.dim() == 3: 
-            target = target.unsqueeze(1)  
-        loss_per_pixel = self.BCE(output, target) 
-
-        weighted_loss = loss_per_pixel.squeeze(1) * pixel_weight  # [B, H, W]
-        loss = weighted_loss.mean()  # Tính giá trị trung bình
-
+        loss = self.CE(output, target)
+        loss = torch.mean(loss * pixel_weight)
         return loss
