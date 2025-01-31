@@ -280,6 +280,8 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
                 'Dice2': f"{train_dice_2.aggregate().item():.4f}"
             })
             
+            iter_num += 1
+            
             if config.debug:
                 break
         
@@ -316,7 +318,6 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         time_elapsed = time.time() - start
         print(f'Epoch {epoch} completed in {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
         
-        iter_num += 1
         
         if config.debug:
             break
