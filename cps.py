@@ -34,8 +34,8 @@ def main(config):
         img_size=config.data.img_size,
         train_aug=config.data.train_aug,
         k=config.fold,
-        lb_dataset=SkinDataset2,
-        ulb_dataset=StrongWeakAugment4
+        lb_dataset=Dataset,
+        ulb_dataset=StrongWeakAugment
     )
       
     l_train_loader = DataLoader(
@@ -75,8 +75,8 @@ def main(config):
 
     # Initialize models
     
-    model1 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
-    model2 = deeplabv3plus_resnet101(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model1 = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
+    model2 = deeplabv3plus_resnet50(num_classes=3, output_stride=8, pretrained_backbone=True)
 
     # Print model statistics
     total_params = sum(p.numel() for p in model1.parameters())
@@ -173,8 +173,8 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         weight_decay=float(config.train.optimizer.adamw.weight_decay)
     )
     
-    scheduler1 = optim.lr_scheduler.StepLR(optimizer1, step_size=20, gamma=0.5)
-    scheduler2 = optim.lr_scheduler.StepLR(optimizer2, step_size=20, gamma=0.5)
+    scheduler1 = optim.lr_scheduler.CosineAnnealingLR(optimizer1, T_max=config.train.num_epochs)
+    scheduler2 = optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=config.train.num_epochs)
 
     # Initialize MONAI metrics for training
     train_dice_1 = DiceMetric(include_background=True, reduction="mean")
@@ -182,6 +182,7 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
     
     max_dice = -float('inf')  # Khởi tạo giá trị Dice tốt nhất
     best_epoch = 0
+    iter_num = 0
     model = model1
     
     torch.save(model.state_dict(), best_model_dir)
@@ -241,7 +242,7 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
             unsup_loss_2 = criterion[0](outputs_u2, pseudo_u1)
             
             # Calculate consistency weight
-            consistency_weight = get_current_consistency_weight(idx // 150)
+            consistency_weight = get_current_consistency_weight(iter_num // 150)
             
             # Total losses
             loss_1 = sup_loss_1 + unsup_loss_1 * consistency_weight * (sup_batch_len / unsup_batch_len)
@@ -314,6 +315,8 @@ def train_val(config, model1, model2, train_loader, val_loader, criterion):
         # Log epoch time
         time_elapsed = time.time() - start
         print(f'Epoch {epoch} completed in {time_elapsed//60:.0f}m {time_elapsed%60:.0f}s')
+        
+        iter_num += 1
         
         if config.debug:
             break
@@ -465,7 +468,7 @@ if __name__=='__main__':
     store_config = config
     config = DotDict(config)
     
-    folds_to_train = [1]
+    folds_to_train = [1,2,3,4,5]
     
     for fold in folds_to_train:
         print(f"\n=== Training Fold {fold} ===")
